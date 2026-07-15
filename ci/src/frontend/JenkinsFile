@@ -1,0 +1,221 @@
+pipeline {
+    agent any
+
+    tools {
+        nodejs 'NodeJS'
+    }
+
+    parameters {
+        choice(
+            name: 'BUILD_FRONTEND',
+            choices: ['True', 'False'],
+            description: 'Trigger frontend build and tests'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+
+        NEXT_PUBLIC_API_URL = credentials('NEXT_PUBLIC_API_URL')
+        SONAR_TOKEN         = credentials('SONAR_TOKEN')
+        SONAR_HOST_URL      = credentials('SONAR_HOST_URL')
+
+        AWS_ACCESS_KEY_ID     = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+        AWS_ECR_ACCOUNT_URL   = credentials('AWS_ECR_ACCOUNT_URL')
+
+        CD_REPO_TOKEN = credentials('CD_REPO_TOKEN')
+        CD_REPO_URL   = credentials('CD_REPO_URL')
+    }
+
+    stages {
+
+        stage('Detect Frontend Changes') {
+            steps {
+                checkout scm
+                script {
+                    def changes = sh(
+                        script: "git diff --name-only HEAD~1 HEAD | grep '^src/frontend/' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    env.FRONTEND_CHANGED = changes ? 'true' : 'false'
+                    echo "Frontend changed: ${env.FRONTEND_CHANGED}"
+                }
+            }
+        }
+
+        stage('Build and Test Frontend') {
+            when {
+                expression {
+                    env.FRONTEND_CHANGED == 'true' || params.BUILD_FRONTEND == 'True'
+                }
+            }
+
+            stages {
+
+                stage('Install Dependencies') {
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npm ci --legacy-peer-deps'
+                        }
+                    }
+                }
+
+                stage('OWASP Dependency Check') {
+                    steps {
+                        dir('src/frontend') {
+                            sh '''
+                            dependency-check.sh \
+                              --project nti-final-project-frontend \
+                              --scan package.json \
+                              --format HTML \
+                              --enableRetired \
+                              --failOnCVSS 7 || true
+                            '''
+                        }
+                    }
+                }
+
+                stage('Create .env.local') {
+                    steps {
+                        dir('src/frontend') {
+                            sh '''
+                            echo "NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL" > .env.local
+                            '''
+                        }
+                    }
+                }
+
+                stage('ESLint') {
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npx eslint . --ext .ts,.tsx --max-warnings 0 || true'
+                        }
+                    }
+                }
+
+                stage('TypeScript Check') {
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npx tsc --noEmit'
+                        }
+                    }
+                }
+
+                // ✅ NEW: Run tests with coverage
+                stage('Run Tests with Coverage') {
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npm test'
+                        }
+                    }
+                }
+
+                stage('Build Next.js') {
+                    environment {
+                        NEXT_TELEMETRY_DISABLED = '1'
+                    }
+                    steps {
+                        dir('src/frontend') {
+                            sh 'npm run build'
+                        }
+                    }
+                }
+
+                stage('SonarQube Scan') {
+                    steps {
+                        withSonarQubeEnv('sonarqube') {
+                            dir('src/frontend') {
+                                sh """
+                                sonar-scanner \
+                                  -Dsonar.projectKey=nti-final-project-frontend \
+                                  -Dsonar.projectName="NTI Final Project - Frontend" \
+                                  -Dsonar.sources=. \
+                                  -Dsonar.exclusions=**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx,**/node_modules/**,**/.next/**,**/public/**,**/out/**,**/*.config.js,**/*.config.ts \
+                                  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+                                """
+                            }
+                        }
+                    }
+                }
+
+                stage('Sonar Quality Gate') {
+                    steps {
+                        timeout(time: 10, unit: 'MINUTES') {
+                            waitForQualityGate abortPipeline: true
+                        }
+                    }
+                }
+
+                stage('Build Docker Image') {
+                    steps {
+                        script {
+                            env.COMMIT_SHA = sh(
+                                script: "git rev-parse --short HEAD",
+                                returnStdout: true
+                            ).trim()
+                        }
+
+                        dir('src/frontend') {
+                            sh '''
+                            docker build \
+                              --build-arg NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+                              -t reddit-frontend:$COMMIT_SHA .
+                            '''
+                        }
+                    }
+                }
+
+                stage('Trivy Scan') {
+                    steps {
+                        sh '''
+                        trivy image \
+                          --severity CRITICAL,HIGH \
+                          --exit-code 1 \
+                          --ignore-unfixed \
+                          --ignorefile src/frontend/.trivyignore \
+                          reddit-frontend:$COMMIT_SHA
+                        '''
+                    }
+                }
+
+                stage('Push Image to ECR') {
+                    steps {
+                        sh '''
+                        aws ecr get-login-password --region $AWS_REGION \
+                          | docker login --username AWS --password-stdin $AWS_ECR_ACCOUNT_URL
+
+                        docker tag reddit-frontend:$COMMIT_SHA \
+                          $AWS_ECR_ACCOUNT_URL/reddit-frontend:$COMMIT_SHA
+
+                        docker push $AWS_ECR_ACCOUNT_URL/reddit-frontend:$COMMIT_SHA
+                        '''
+                    }
+                }
+
+                stage('Update Helm Values Repo') {
+                    steps {
+                        sh '''
+                        git clone https://$CD_REPO_TOKEN@github.com/$CD_REPO_URL.git cd-repo
+                        cd cd-repo
+
+                        git config user.name "Jenkins CI"
+                        git config user.email "jenkins@ci.local"
+
+                        wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+                        chmod +x /usr/local/bin/yq
+
+                        NEW_IMAGE=$AWS_ECR_ACCOUNT_URL/reddit-frontend:$COMMIT_SHA
+                        yq -i ".deployment.image = \\"$NEW_IMAGE\\"" helm-charts/frontend/values.yaml
+
+                        git add helm-charts/frontend/values.yaml
+                        git commit -m "chore(frontend): update image tag to $COMMIT_SHA"
+                        git push origin main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

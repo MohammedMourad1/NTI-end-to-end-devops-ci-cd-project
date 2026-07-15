@@ -1,0 +1,230 @@
+name: Backend CI
+
+on: 
+  workflow_dispatch:
+    inputs:
+      build-backend:
+        description: 'Trigger backend build and tests'
+        required: false
+        default: 'False'
+        type: choice
+        options:
+          - 'True'
+          - 'False'
+
+env:
+  USE_S3: True
+  AWS_REGION: us-east-1
+
+jobs:
+
+  detect-changes:
+    name: Detect Backend Changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend_changed: ${{ steps.backend_changes.outputs.backend }}
+                     
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for backend changes
+        id: backend_changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            backend:
+              - 'src/backend/**'
+
+      - name: Show backend change status
+        run: |
+          echo "Backend changed: ${{ steps.backend_changes.outputs.backend }}"
+  
+  backend-build:
+    name: Build and Test Backend
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.backend_changed == 'true'|| github.event.inputs.build-backend == 'True'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ./src/backend/requirements.txt
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'nti-final-project-backend'
+          path: './src/backend/requirements.txt'
+          format: 'HTML'
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+
+      - name: Create .env file
+        working-directory: ./src/backend
+        run: |
+          cat > .env << EOF
+          USE_S3=${{ env.USE_S3 }}
+          DJANGO_SECRET_KEY=${{ secrets.DJANGO_SECRET_KEY }}
+          DJANGO_DEBUG=True
+          DATABASE_URL=sqlite:///./db.sqlite3
+          DJANGO_ALLOWED_HOSTS=*
+          DJANGO_SECURE=False
+          DJANGO_EMAIL_BACKEND=django.core.mail.backends.console.EmailBackend
+          AWS_BUCKET_NAME=${{ secrets.AWS_BUCKET_NAME }}
+          AWS_S3_REGION_NAME=${{ env.AWS_REGION }}
+          AWS_S3_CUSTOM_DOMAIN=${{ secrets.AWS_S3_CUSTOM_DOMAIN }}
+          AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EOF
+      
+      - name: Run migrations
+        working-directory: ./src/backend
+        run: |
+          python manage.py migrate
+
+      - name: Run pytest with coverage
+        working-directory: ./src/backend
+        run: |
+          pytest --cov --cov-report=term-missing --cov-report=xml:coverage.xml
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          projectBaseDir: src/backend
+          args: >
+            -Dsonar.projectKey=nti-final-project-backend
+            -Dsonar.projectName="NTI Final Project - Backend"
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/migrations/**,**/tests.py,**/test_*.py,**/__pycache__/**,**/htmlcov/**,**/staticfiles/**,**/.pytest_cache/**,**/media/**,**/*.coverage,**/coverage.xml,**/*.sqlite3,**/.env*,**/.gitignore,**/.dockerignore,**/*.pyc,**/*.pyo,**/conftest.py,**/pytest.ini,**/.coveragerc,**/run_tests.sh,**/*.md
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.python.version=3.12
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate Check
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        with:
+          scanMetadataReportFile: src/backend/.scannerwork/report-task.txt
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Collect static files
+        working-directory: ./src/backend
+        run: |
+          python manage.py collectstatic --noinput
+
+      - name: Get commit short SHA
+        id: get_sha
+        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Docker image build
+        working-directory: ./src/backend
+        run: |
+          docker build -t reddit-backend:${{ env.COMMIT_SHA }} .
+
+      - name: Trivy - Scan Docker Image for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: reddit-backend:${{ env.COMMIT_SHA }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: 'src/backend/.trivyignore'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR Login
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_ACCOUNT_URL }}
+
+      - name: Tag Docker image for ECR
+        run: |
+          docker tag reddit-backend:${{ env.COMMIT_SHA }} ${{ secrets.AWS_ECR_ACCOUNT_URL }}/reddit-backend:${{ env.COMMIT_SHA }}
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ secrets.AWS_ECR_ACCOUNT_URL }}/reddit-backend:${{ env.COMMIT_SHA }}
+
+      - name: Update Helm Values in CD Repository
+        env:
+          CD_REPO_TOKEN: ${{ secrets.CD_REPO_TOKEN }}
+          CD_REPO_URL: ${{ secrets.CD_REPO_URL }}
+        run: |
+          # Clone the CD repository
+          git clone https://${CD_REPO_TOKEN}@github.com/${CD_REPO_URL}.git cd-repo
+          cd cd-repo
+          
+          # Configure git
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+          # Update the backend image tag in values.yaml
+          NEW_IMAGE="${{ secrets.AWS_ECR_ACCOUNT_URL }}/reddit-backend:${{ env.COMMIT_SHA }}"
+          
+          # Use yq to update the image value (install yq first)
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          
+          # Update the deployment.image in backend values.yaml
+          yq -i '.deployment.image = "'"${NEW_IMAGE}"'"' helm-charts/backend/values.yaml
+          
+          # Commit and push changes
+          git add helm-charts/backend/values.yaml
+          git commit -m "chore(backend): update image tag to ${{ env.COMMIT_SHA }}
+
+          Automated update from CI pipeline
+          Commit: ${{ github.sha }}
+          Run: ${{ github.run_id }}"
+          
+          git push origin main
+          
+          echo "Successfully updated backend image to: ${NEW_IMAGE}"
+
+      - name: Notify n8n (Success)
+        if: success()
+        run: |
+          curl -X  POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "status": "success",
+            "repo": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "env": "production"
+          }'
+
+      - name: Notify n8n (Failure)
+        if: failure()
+        run: |
+          curl -X  POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "status": "failure",
+            "repo": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "actor": "${{ github.actor }}",
+            "env": "production"
+          }'
