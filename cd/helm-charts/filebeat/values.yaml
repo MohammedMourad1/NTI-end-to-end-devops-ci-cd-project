@@ -1,0 +1,37 @@
+# Filebeat values for Reddit Clone logging
+filebeat:
+  podAnnotations:
+    rollout.restart/trigger: "2026-02-12-fix-es-password"
+  daemonset:
+    filebeatConfig:
+      filebeat.yml: |
+        filebeat.inputs:
+        - type: container
+          paths:
+            - /var/log/containers/*.log
+          processors:
+            - add_kubernetes_metadata:
+                host: ${NODE_NAME}
+                matchers:
+                  - logs_path:
+                      logs_path: "/var/log/containers/"
+        output.elasticsearch:
+          hosts: ['https://elasticsearch-master:9200']
+          username: elastic
+          password: '${ELASTICSEARCH_PASSWORD}'
+          ssl.verification_mode: none
+
+    extraEnvs:
+      - name: ELASTICSEARCH_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: elasticsearch-master-credentials
+            key: password
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi

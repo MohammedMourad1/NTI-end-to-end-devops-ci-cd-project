@@ -1,0 +1,30 @@
+# Elasticsearch values for Reddit Clone logging
+elasticsearch:
+  replicas: 1
+  minimumMasterNodes: 1
+
+  # Single-node cluster will never reach green, use yellow
+  clusterHealthCheckParams: "wait_for_status=yellow&timeout=1s"
+
+  # Fix elastic password to prevent random regeneration on each sync
+  secret:
+    enabled: true
+    password: "UTg6kzxeaoV303Gc"
+
+  esJavaOpts: "-Xmx1g -Xms1g"
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  volumeClaimTemplate:
+    resources:
+      requests:
+        storage: 5Gi
+
+  persistence:
+    enabled: true

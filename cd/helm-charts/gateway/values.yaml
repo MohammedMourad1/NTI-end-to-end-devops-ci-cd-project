@@ -1,0 +1,113 @@
+# Gateway Helm Chart Values
+# Default values for reddit-gateway
+
+# Namespace Configuration
+namespace: default
+
+# TLS Configuration
+tls:
+  enabled: true
+  issuerName: letsencrypt-prod
+  issuerKind: ClusterIssuer
+  # Certificates to create
+  # NOTE: abdallahfekry.com (apex) requires DNS fix in GoDaddy - currently only www works
+  certificates:
+    - name: reddit-tls-cert
+      secretName: reddit-tls-cert
+      dnsNames:
+        - www.abdallahfekry.com
+
+# Gateway Configuration
+gateway:
+  enabled: true
+  name: reddit-gateway
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: www.abdallahfekry.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: reddit-tls-cert
+            kind: Secret
+      allowedRoutes:
+        namespaces:
+          from: All
+
+# HTTP to HTTPS Redirect Route
+redirectRoute:
+  enabled: true
+  name: http-to-https-redirect
+  hostnames:
+    - www.abdallahfekry.com
+
+# Combined HTTPRoute for both frontend and backend
+# DISABLED: Using separate HTTPRoutes in reddit-app namespace instead
+# Cross-namespace routing requires ReferenceGrant which adds complexity
+httproute:
+  enabled: false
+  name: reddit-httproute
+  hostnames: []  # Set your hostname here, e.g., ["reddit.yourdomain.com"]
+  rules:
+    # API routes to backend
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: reddit-backend-service
+          namespace: reddit-app
+          port: 8000
+    # Admin routes to backend
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /admin
+      backendRefs:
+        - name: reddit-backend-service
+          namespace: reddit-app
+          port: 8000
+    # Static files from backend
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /static
+      backendRefs:
+        - name: reddit-backend-service
+          namespace: reddit-app
+          port: 8000
+    # Media files from backend
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /media
+      backendRefs:
+        - name: reddit-backend-service
+          namespace: reddit-app
+          port: 8000
+    # Prometheus metrics
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /metrics
+      backendRefs:
+        - name: reddit-backend-service
+          namespace: reddit-app
+          port: 8000
+    # All other routes to frontend (catch-all - must be last)
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: reddit-frontend-service
+          namespace: reddit-app
+          port: 80
