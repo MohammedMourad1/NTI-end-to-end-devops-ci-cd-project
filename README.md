@@ -1,4 +1,5 @@
 # End-to-End DevSecOps CI/CD Platform on AWS
+<img width="1536" height="1024" alt="NTI Final Project" src="https://github.com/user-attachments/assets/e2b5efec-6009-4df0-8e7a-e4e7addb98a3" />
 
 A complete end-to-end DevSecOps project demonstrating automated infrastructure provisioning, Continuous Integration, security and code quality validation, GitOps-based Continuous Deployment, Kubernetes orchestration, monitoring, and centralized logging on AWS.
 
